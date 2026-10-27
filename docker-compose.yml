@@ -1,0 +1,26 @@
+services:
+  proofpath:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      PORT: "8000"
+      PROOFPATH_DATA_DIR: /data
+      PROOFPATH_SUPERADMIN_USERNAME: ${PROOFPATH_SUPERADMIN_USERNAME:-superadmin}
+      PROOFPATH_SUPERADMIN_PASSWORD: ${PROOFPATH_SUPERADMIN_PASSWORD:-}
+      PROOFPATH_SESSION_SECRET: ${PROOFPATH_SESSION_SECRET:?Set this in .env}
+      PROOFPATH_COOKIE_SECURE: "1"
+      # Optional AI endpoints. Leave empty to disable a capability.
+      PROOFPATH_MODAL_SAM_ENDPOINT: ${PROOFPATH_MODAL_SAM_ENDPOINT:-}
+      PROOFPATH_MODAL_TOKEN: ${PROOFPATH_MODAL_TOKEN:-}
+      PROOFPATH_SPARK_ENDPOINT: ${PROOFPATH_SPARK_ENDPOINT:-}
+      PROOFPATH_SPARK_API_KEY: ${PROOFPATH_SPARK_API_KEY:-}
+      PROOFPATH_SPARK_MODEL: ${PROOFPATH_SPARK_MODEL:-muse-spark}
+      PROOFPATH_IMAGE_ENDPOINT: ${PROOFPATH_IMAGE_ENDPOINT:-}
+      PROOFPATH_IMAGE_API_KEY: ${PROOFPATH_IMAGE_API_KEY:-}
+    volumes:
+      - proofpath-data:/data
+
+volumes:
+  proofpath-data:
