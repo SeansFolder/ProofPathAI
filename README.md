@@ -76,6 +76,8 @@ python -m pytest
 
 ## Deploy with Docker
 
+For automated validation, GitHub runs **ProofPath checks** on pushes and pull requests: frontend navigation tests and production build, plus the backend API suite. The [handoff test checklist](docs/TEST_CHECKLIST.md) tracks manual acceptance checks and the two known frontend navigation edge cases. Backend integration assumptions are documented in [the backend handoff](frontend/BACKEND_HANDOFF.md).
+
 Copy `.env.example` to `.env`, replace the sample values with unique secrets, then run:
 
 ```sh

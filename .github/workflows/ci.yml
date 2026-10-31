@@ -1,0 +1,105 @@
+name: ProofPath checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Run navigation regression tests
+        run: npm test
+      - name: Build production frontend
+        run: npm run build
+      - name: Summarize frontend checks
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Frontend checks
+          - [x] Install dependencies from the lockfile.
+          - [x] Run navigation helper regression tests.
+          - [x] Build the production frontend.
+
+          Browser flows and known navigation issues require the manual checklist in `docs/TEST_CHECKLIST.md`.
+          EOF
+
+  backend:
+    name: Backend API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROOFPATH_DATA_DIR: ${{ runner.temp }}/proofpath-ci-data
+      PROOFPATH_SUPERADMIN_USERNAME: testroot
+      PROOFPATH_SUPERADMIN_PASSWORD: ci-test-only-passphrase-16-characters
+      PROOFPATH_SESSION_SECRET: ci-test-only-session-secret-at-least-32-characters
+      PROOFPATH_SEED_DEMO_ACCOUNTS: '0'
+      PROOFPATH_MODAL_SAM_ENDPOINT: ''
+      PROOFPATH_SPARK_ENDPOINT: ''
+      PROOFPATH_IMAGE_ENDPOINT: ''
+      PROOFPATH_EMAIL_API_URL: ''
+      PROOFPATH_SMTP_HOST: ''
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      # The public-homepage API test checks FastAPI serving the built app.
+      - name: Set up Node.js for the served-frontend integration test
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+      - name: Build the frontend served by API tests
+        working-directory: frontend
+        run: npm run build
+      - name: Run backend API tests
+        run: python -m pytest -q
+      - name: Summarize backend checks
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Backend checks
+          - [x] Install backend and test dependencies.
+          - [x] Build the frontend used by the public-homepage API test.
+          - [x] Run the API, account, ownership, recovery, and email tests.
+
+          Tests use temporary data and test-only credentials. A green run does not certify live email delivery, paid AI integration, or completion of the manual acceptance checklist.
+          EOF
