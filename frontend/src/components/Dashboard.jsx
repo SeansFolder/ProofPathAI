@@ -1,7 +1,9 @@
-import React, { useMemo, useState } from 'react';
-import ReportItem from './ReportItem.jsx';
+import React from 'react';
+import JournalCard from './JournalCard.jsx';
+import './Journal.css';
 
 export default function Dashboard({
+  sessionUser,
   reports,
   canView,
   canCreate,
@@ -9,93 +11,107 @@ export default function Dashboard({
   canStatus,
   canDelete,
   highlightId,
+  reportsError,
   onOpenWizard,
-  onUpdateReport,
-  onDeleteReport,
+  onOpenReport,
+  onOpenPassword,
+  onRetry,
 }) {
-  const [query, setQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
-
-  const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return reports.filter((report) => {
-      const searchable = [report.title, report.category, report.description, report.location || ''].join(' ').toLowerCase();
-      return (!q || searchable.includes(q)) && (!statusFilter || report.status === statusFilter);
-    });
-  }, [reports, query, statusFilter]);
-
-  if (!canView) return null;
+  const roleLabel = sessionUser?.role === 'super_admin' ? 'SUPER ADMIN' : sessionUser?.role === 'resident' ? 'RESIDENT' : 'ADMIN';
+  const ownOnly = sessionUser?.role === 'resident';
+  const viewOnly = canView && !canCreate && !canEdit && !canStatus && !canDelete;
 
   return (
     <section className="journal" id="dashboard" aria-labelledby="journal-heading">
       <div className="journal-heading">
         <div>
-          <p className="eyebrow">YOUR COMMUNITY JOURNAL</p>
-          <h1 id="journal-heading">Your reports</h1>
-          <p className="journal-intro">A clear record of what you noticed, with evidence and follow-up in one place.</p>
+          <p className="eyebrow">{roleLabel}</p>
+          <h1 id="journal-heading">{ownOnly ? 'My reports' : 'Community reports'}</h1>
+          <p className="journal-intro">{ownOnly ? 'Reports you created, with their evidence and follow-up.' : 'A shared record of community concerns, supporting evidence, and follow-up.'}</p>
         </div>
-        {canCreate && (
-          <button className="submit-button new-report-button" type="button" onClick={onOpenWizard}>
-            <span>New report</span>
-            <span aria-hidden="true">+</span>
+        <div className="journal-heading-actions">
+          {canCreate && (
+            <button className="journal-new-report" type="button" onClick={onOpenWizard}>
+              New report
+            </button>
+          )}
+          <button className="journal-outline-button" type="button" onClick={onOpenPassword}>
+            Change password
           </button>
-        )}
+        </div>
       </div>
 
-      <section className="reports-panel" aria-label="Saved reports">
-        <div className="reports-toolbar">
-          <div>
+      {!canView && (
+        <div className="journal-no-access">
+          <h2>Report access has not been enabled</h2>
+          <p>Your account is active, but no report permissions have been assigned. Ask a super admin to update your access.</p>
+          <button type="button" className="journal-outline-button" onClick={onOpenPassword}>
+            Change my password
+          </button>
+        </div>
+      )}
+
+      {canView && (
+        <>
+          {viewOnly && (
+            <p className="journal-notice" role="status">
+              View-only access. Ask a super admin if you need to create or update reports.
+            </p>
+          )}
+          <div className="journal-toolbar">
             <p className="eyebrow">REPORT JOURNAL</p>
-            <span className="reports-subtitle">Your saved reports stay with your account.</span>
+            <span className="journal-workspace">{ownOnly ? 'Personal workspace' : 'Shared workspace'}</span>
           </div>
-          <span className="report-count">{reports.length}</span>
-        </div>
-        <div className="report-filters">
-          <label className="sr-only" htmlFor="report-search">
-            Search reports
-          </label>
-          <input id="report-search" type="search" placeholder="Search reports" value={query} onChange={(event) => setQuery(event.target.value)} />
-          <label className="sr-only" htmlFor="status-filter">
-            Filter by status
-          </label>
-          <select id="status-filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
-            <option value="">All statuses</option>
-            <option>Draft</option>
-            <option>Submitted</option>
-            <option>Resolved</option>
-          </select>
-        </div>
-        <div className="report-list" aria-live="polite">
-          {visible.length === 0 && reports.length === 0 && (
-            <div className="empty-state">
-              <span className="empty-line" aria-hidden="true"></span>
-              <p>No reports yet</p>
-              <span>Start with a photo of something you noticed.</span>
-              {canCreate && (
-                <button className="text-link empty-new-report" type="button" onClick={onOpenWizard}>
-                  Start a report <span aria-hidden="true">→</span>
+          {reportsError && reports.length > 0 && (
+            <p className="journal-notice" role="alert">
+              Reports could not be refreshed. Showing the last loaded list.{' '}
+              {onRetry && (
+                <button type="button" className="text-link" onClick={onRetry}>
+                  Try again
                 </button>
               )}
-            </div>
+            </p>
           )}
-          {visible.length === 0 && reports.length > 0 && <p className="empty-state">No reports match these filters.</p>}
-          {visible.map((report) => (
-            <ReportItem
-              key={report.id}
-              report={report}
-              canEdit={canEdit}
-              canStatus={canStatus}
-              canDelete={canDelete}
-              highlighted={highlightId === report.id}
-              onUpdate={onUpdateReport}
-              onDelete={onDeleteReport}
-            />
-          ))}
-        </div>
-        <p className="panel-footnote">
-          <span className="footnote-dot"></span>Submitted and resolved are personal tracking labels; they do not contact an agency.
-        </p>
-      </section>
+          <div className="journal-list" aria-live="polite">
+            {reportsError && reports.length === 0 && (
+              <div className="empty-state">
+                <span className="empty-line" aria-hidden="true"></span>
+                <p>Reports could not be loaded</p>
+                <span>Check your connection and try again — this is not the same as having no reports.</span>
+                {onRetry && (
+                  <button className="text-link empty-new-report" type="button" onClick={onRetry}>
+                    Try again <span aria-hidden="true">→</span>
+                  </button>
+                )}
+              </div>
+            )}
+            {!reportsError && reports.length === 0 && (
+              <div className="empty-state">
+                <span className="empty-line" aria-hidden="true"></span>
+                <p>No reports yet</p>
+                <span>Reports shared with this workspace will appear here.</span>
+                {canCreate && (
+                  <button className="text-link empty-new-report" type="button" onClick={onOpenWizard}>
+                    Start a report <span aria-hidden="true">→</span>
+                  </button>
+                )}
+              </div>
+            )}
+            {reports.map((report) => (
+              <JournalCard
+                key={report.id}
+                report={report}
+                canEdit={canEdit}
+                canStatus={canStatus}
+                canDelete={canDelete}
+                highlighted={highlightId === report.id}
+                onOpen={onOpenReport}
+              />
+            ))}
+          </div>
+          <p className="journal-footnote">Submitted and Resolved are local status labels. They do not confirm an agency response.</p>
+        </>
+      )}
     </section>
   );
 }

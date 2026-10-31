@@ -1,67 +1,190 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ACCEPTED_TYPES, CATEGORIES, MAX_UPLOAD_BYTES, api } from '../api.js';
+import { ACCEPTED_TYPES, CATEGORIES, MAX_UPLOAD_BYTES, api, formatLongDate } from '../api.js';
+import { markDraftScreen, savePendingDraft } from '../draftStore.js';
+import ConfirmDialog from './ConfirmDialog.jsx';
 
-const STEP_LABELS = ['Evidence', 'Observation', 'Details', 'Review'];
+const STEPS = ['Evidence', 'Observations', 'Details', 'Review'];
+const OVERLAY_FILLS = ['rgba(36, 77, 60, 0.32)', 'rgba(163, 124, 52, 0.34)'];
 
-export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
-  const [step, setStep] = useState(1);
-  const [file, setFile] = useState(null);
+function padNumber(value) {
+  return String(value).padStart(2, '0');
+}
+
+function prettifyLabel(label) {
+  const cleaned = String(label || '').replace(/[_-]+/g, ' ').trim();
+  if (!cleaned) return 'Unlabeled region';
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+function observationFromMask(mask, index) {
+  const id = padNumber(index + 1);
+  const label = prettifyLabel(mask.label);
+  const confidence = Math.round((mask.score || 0) * 100);
+  return {
+    id,
+    title: label,
+    body: `AI outline ${id} · ${label} · ${confidence}% confidence. Include only if you can verify it in the photo.`,
+    selected: true,
+  };
+}
+
+function selectedObservations(observations) {
+  return observations.filter((item) => item.selected);
+}
+
+function composeDescription(observations, location, assistText) {
+  const parts = [];
+  if (assistText) {
+    parts.push(assistText);
+  } else if (observations.length > 0) {
+    parts.push(`Observed: ${observations.map((item) => item.title).join('; ')}.`);
+  }
+  if (location) parts.push(`Location supplied by the resident: ${location}.`);
+  return parts.join(' ');
+}
+
+export default function Wizard({ aiStatus, signedIn, ownerId = null, initialCategory = '', initialDraft = null, onSaved, onCancel, onRequireAccount, onSignIn }) {
+  const draftPhase = ['evidence', 'observations', 'details', 'review'].includes(initialDraft?.phase) && initialDraft?.file
+    ? initialDraft.phase
+    : 'evidence';
+  const [phase, setPhase] = useState(draftPhase);
+  const [file, setFile] = useState(initialDraft?.file || null);
   const [previewUrl, setPreviewUrl] = useState(null);
+  const [displayUrl, setDisplayUrl] = useState(null);
   const [evidenceError, setEvidenceError] = useState('');
-  const [stripMetadata, setStripMetadata] = useState(true);
-  const [blurActive, setBlurActive] = useState(false);
-  const [privacyHelp, setPrivacyHelp] = useState('Photo metadata can reveal where an image was taken. Video metadata is not removed.');
+  const [stripMetadata, setStripMetadata] = useState(initialDraft?.stripMetadata ?? true);
+  const [blurDetails, setBlurDetails] = useState(initialDraft?.blurDetails ?? true);
+  const [blurHint, setBlurHint] = useState('Drag on the photo to blur faces, plates, or other identifying details.');
   const [dragging, setDragging] = useState(false);
-  const [description, setDescription] = useState('');
-  const [title, setTitle] = useState('');
-  const [category, setCategory] = useState('');
-  const [location, setLocation] = useState('');
-  const [segmentMessage, setSegmentMessage] = useState('Outlines highlight relevant parts of the photo. They never change your words.');
-  const [segmentMasks, setSegmentMasks] = useState([]);
-  const [segmentsVisible, setSegmentsVisible] = useState(false);
-  const [segmentBusy, setSegmentBusy] = useState(false);
-  const [assist, setAssist] = useState(null);
-  const [assistBusy, setAssistBusy] = useState(false);
+  const [analysisNote, setAnalysisNote] = useState('');
+  const [analysisError, setAnalysisError] = useState('');
+  const [assistText, setAssistText] = useState('');
+  const [assistProvider, setAssistProvider] = useState('');
+  const [observations, setObservations] = useState(initialDraft?.observations || []);
+  const [masks, setMasks] = useState([]);
+  const [showOverlay, setShowOverlay] = useState(true);
+  const [customTitle, setCustomTitle] = useState('');
+  const [customBody, setCustomBody] = useState('');
+  const [location, setLocation] = useState(initialDraft?.location || '');
+  const [category, setCategory] = useState(initialDraft?.category || initialCategory);
+  const [observedDate, setObservedDate] = useState(initialDraft?.observedDate || '');
+  const [residentContext, setResidentContext] = useState(initialDraft?.residentContext || '');
+  const [title, setTitle] = useState(initialDraft?.title || '');
+  const [titleDirty, setTitleDirty] = useState(Boolean(initialDraft?.title));
+  const [description, setDescription] = useState(initialDraft?.description || '');
+  const [descriptionDirty, setDescriptionDirty] = useState(Boolean(initialDraft?.description));
   const [submitBusy, setSubmitBusy] = useState(false);
   const [formMessage, setFormMessage] = useState('');
   const [formError, setFormError] = useState(false);
+  // True once a protected call answers 401: the draft stays autosaved while
+  // the visitor signs back in through onSignIn (no hard redirect, no loss).
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const formRef = useRef(null);
   const fileInputRef = useRef(null);
   const canvasRef = useRef(null);
-  const videoRef = useRef(null);
-  const segmentCanvasRef = useRef(null);
-  const descriptionRef = useRef(null);
-  const sectionRefs = useRef({});
   const topRef = useRef(null);
   const loadedPhotoRef = useRef(null);
   const photoReadyRef = useRef(Promise.resolve());
-  const redactionPathsRef = useRef([]);
+  const redactionPathsRef = useRef(initialDraft?.redactionPaths || []);
   const activeRedactionRef = useRef(null);
-  const blurActiveRef = useRef(false);
+  const savedFileRef = useRef(null);
+
+  // Snapshot the in-progress draft (photo, reviewed details, location, and
+  // privacy choices) so the save-gate handoff can restore it after auth.
+  function collectDraft(atPhase) {
+    return {
+      file,
+      title,
+      category,
+      description,
+      location,
+      observedDate,
+      residentContext,
+      observations,
+      stripMetadata,
+      blurDetails,
+      redactionPaths: redactionPathsRef.current,
+      phase: atPhase,
+      ownerId,
+    };
+  }
+  const analyzeAbortRef = useRef(null);
+  const displayUrlsRef = useRef([]);
+  const phaseRef = useRef(phase);
 
   const isVideo = Boolean(file && file.type.startsWith('video/'));
   const segmentationOn = Boolean(aiStatus?.segmentation?.configured);
   const reasoningOn = Boolean(aiStatus?.reasoning?.configured);
-
-  const completeCount = useMemo(
-    () => [Boolean(file), Boolean(category), Boolean(title.trim()), Boolean(description.trim())].filter(Boolean).length,
-    [file, category, title, description]
-  );
+  const checked = useMemo(() => selectedObservations(observations), [observations]);
+  const missingDetails = useMemo(() => {
+    const missing = [];
+    if (!location.trim()) missing.push('location');
+    if (!category) missing.push('category');
+    if (title.trim().length < 3) missing.push('title');
+    if (description.trim().length < 10) missing.push('description');
+    return missing;
+  }, [location, category, title, description]);
+  const detailsComplete = missingDetails.length === 0;
 
   useEffect(() => {
-    blurActiveRef.current = blurActive;
-  }, [blurActive]);
+    phaseRef.current = phase;
+  }, [phase]);
+
+  // Keep the in-progress draft restorable across refresh, registration, the
+  // full-page verify link, and sign-in. Metadata goes to localStorage on
+  // every meaningful change; the file stays in IndexedDB.
+  useEffect(() => {
+    markDraftScreen('wizard');
+  }, []);
+
+  useEffect(() => {
+    const empty =
+      !file && !title.trim() && !category && !description.trim() && !location.trim()
+      && !residentContext.trim() && !observedDate && observations.length === 0;
+    if (empty) return;
+    // The file is rewritten to IndexedDB only when it changes; metadata is
+    // cheap to rewrite on every keystroke.
+    const nextFile = file !== savedFileRef.current ? file : null;
+    savedFileRef.current = file;
+    savePendingDraft({
+      title,
+      category,
+      description,
+      location,
+      observedDate,
+      residentContext,
+      observations,
+      stripMetadata,
+      blurDetails,
+      redactionPaths: redactionPathsRef.current,
+      phase,
+      file: nextFile,
+      ownerId,
+    });
+  }, [file, title, category, description, location, observedDate, residentContext, observations, stripMetadata, blurDetails, phase, ownerId]);
+
+  useEffect(() => () => {
+    for (const url of displayUrlsRef.current) URL.revokeObjectURL(url);
+    if (analyzeAbortRef.current) analyzeAbortRef.current.abort();
+  }, []);
 
   useEffect(() => {
     if (!file) {
       setPreviewUrl(null);
+      setDisplayUrl(null);
       return undefined;
     }
     const url = URL.createObjectURL(file);
     setPreviewUrl(url);
+    if (file.type.startsWith('video/')) setDisplayUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [file]);
+
+  function trackDisplayUrl(url) {
+    if (url && url.startsWith('blob:')) displayUrlsRef.current.push(url);
+    setDisplayUrl(url);
+  }
 
   function drawPhotoPreview() {
     const canvas = canvasRef.current;
@@ -70,7 +193,7 @@ export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
     const context = canvas.getContext('2d');
     context.clearRect(0, 0, canvas.width, canvas.height);
     context.drawImage(photo, 0, 0, canvas.width, canvas.height);
-    const paths = redactionPathsRef.current;
+    const paths = blurDetails ? redactionPathsRef.current : [];
     if (paths.length === 0) return;
     const blurred = document.createElement('canvas');
     blurred.width = canvas.width;
@@ -111,7 +234,8 @@ export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
       photoReadyRef.current = Promise.resolve();
       return;
     }
-    redactionPathsRef.current = [];
+    // Restored drafts keep their blur marks: only acceptFile/removePhoto
+    // clear redactions, so a returning draft is never wiped on reload.
     activeRedactionRef.current = null;
     const photo = new Image();
     photoReadyRef.current = new Promise((resolve) => {
@@ -127,36 +251,151 @@ export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
         resolve();
       };
       photo.onerror = () => {
+        setEvidenceError('We could not read that file. Choose a clear JPG or PNG photo to try again.');
         setFile(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
-        setEvidenceError('This image could not be previewed. Choose a different photo.');
         resolve();
       };
     });
     photo.src = previewUrl;
-    setPrivacyHelp('Turn on the blur tool, then drag over identifying details in the photo.');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file, previewUrl]);
 
+  useEffect(() => {
+    drawPhotoPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blurDetails]);
+
+  function needsPrivacyPrepare() {
+    return Boolean(file) && !file.type.startsWith('video/') && (stripMetadata || (blurDetails && redactionPathsRef.current.length > 0));
+  }
+
+  function renderPrivacyCanvas() {
+    const photo = loadedPhotoRef.current;
+    if (!photo || !photo.naturalWidth || !photo.naturalHeight) return null;
+    const scale = Math.min(1, 2400 / Math.max(photo.naturalWidth, photo.naturalHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(photo.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(photo.naturalHeight * scale));
+    const context = canvas.getContext('2d');
+    context.drawImage(photo, 0, 0, canvas.width, canvas.height);
+    const paths = blurDetails ? redactionPathsRef.current : [];
+    if (paths.length === 0) return canvas;
+    const blurred = document.createElement('canvas');
+    blurred.width = canvas.width;
+    blurred.height = canvas.height;
+    const blurredContext = blurred.getContext('2d');
+    blurredContext.filter = 'blur(14px)';
+    blurredContext.drawImage(photo, 0, 0, blurred.width, blurred.height);
+    blurredContext.filter = 'none';
+    const mask = document.createElement('canvas');
+    mask.width = canvas.width;
+    mask.height = canvas.height;
+    const maskContext = mask.getContext('2d');
+    maskContext.strokeStyle = '#fff';
+    maskContext.lineWidth = Math.max(24, canvas.width * 0.045);
+    maskContext.lineCap = 'round';
+    maskContext.lineJoin = 'round';
+    for (const path of paths) {
+      if (path.length === 1) {
+        maskContext.beginPath();
+        maskContext.arc(path[0].x, path[0].y, maskContext.lineWidth / 2, 0, Math.PI * 2);
+        maskContext.fillStyle = '#fff';
+        maskContext.fill();
+        continue;
+      }
+      maskContext.beginPath();
+      maskContext.moveTo(path[0].x, path[0].y);
+      for (const point of path.slice(1)) maskContext.lineTo(point.x, point.y);
+      maskContext.stroke();
+    }
+    blurredContext.globalCompositeOperation = 'destination-in';
+    blurredContext.drawImage(mask, 0, 0);
+    context.drawImage(blurred, 0, 0);
+    return canvas;
+  }
+
+  function refreshDisplayPreview() {
+    if (!file) {
+      setDisplayUrl(null);
+      return;
+    }
+    if (!needsPrivacyPrepare()) {
+      setDisplayUrl(previewUrl);
+      return;
+    }
+    photoReadyRef.current.then(() => {
+      const canvas = renderPrivacyCanvas();
+      if (!canvas) {
+        setDisplayUrl(previewUrl);
+        return;
+      }
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          setDisplayUrl(previewUrl);
+          return;
+        }
+        trackDisplayUrl(URL.createObjectURL(blob));
+      }, file.type, 0.92);
+    });
+  }
+
+  const [pendingFile, setPendingFile] = useState(null);
+
+  function applyFile(next) {
+    redactionPathsRef.current = [];
+    activeRedactionRef.current = null;
+    setObservations([]);
+    setMasks([]);
+    setAnalysisNote('');
+    setAnalysisError('');
+    setAssistText('');
+    setAssistProvider('');
+    setFormMessage('');
+    setFile(next);
+  }
+
   function acceptFile(next) {
     setEvidenceError('');
-    setSegmentMasks([]);
-    setSegmentsVisible(false);
-    setAssist(null);
     if (!next) return;
     if (!ACCEPTED_TYPES.has(next.type)) {
-      setEvidenceError('Choose a JPG, PNG, WebP, MP4, or MOV file.');
+      setEvidenceError('We could not read that file. Choose a clear JPG or PNG photo to try again.');
+      setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       return;
     }
     if (next.size > MAX_UPLOAD_BYTES) {
-      setEvidenceError('Evidence must be smaller than 20 MB.');
+      setEvidenceError('Evidence must be smaller than 20 MB. Choose another file to continue.');
+      setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       return;
     }
+    // Replacing evidence discards analysis and edits tied to the current
+    // file, so confirm first when there is anything to lose.
+    const losesWork = Boolean(file) && (
+      observations.length > 0 || masks.length > 0 || assistText !== '' ||
+      description.trim() !== '' || title.trim() !== '' || redactionPathsRef.current.length > 0
+    );
+    if (losesWork) {
+      setPendingFile(next);
+      return;
+    }
+    applyFile(next);
+  }
+
+  function removePhoto() {
+    setFile(null);
+    setObservations([]);
+    setMasks([]);
+    setAnalysisNote('');
+    setAnalysisError('');
+    setAssistText('');
+    setAssistProvider('');
+    setEvidenceError('');
     redactionPathsRef.current = [];
     activeRedactionRef.current = null;
-    setBlurActive(false);
-    setFormMessage('');
-    setFile(next);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    setPhase('evidence');
   }
 
   function imagePoint(event) {
@@ -172,135 +411,195 @@ export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
     redactionPathsRef.current = [];
     activeRedactionRef.current = null;
     drawPhotoPreview();
-    setPrivacyHelp('Blur marks cleared. Turn on the blur tool to mark details.');
+    setBlurHint('Blur marks cleared. Drag on the photo to mark details again.');
+  }
+
+  function goToPhase(next) {
+    if (next === 'observations' || next === 'details' || next === 'review') refreshDisplayPreview();
+    setPhase(next);
+    topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function startAnalysis() {
+    if (!file) return;
+    if (!signedIn) {
+      // Guests continue without AI: analysis needs a signed-in account, so
+      // the guest reviews manually added observations only. Nothing is
+      // fabricated here; the save gate at review handles sign-in.
+      setMasks([]);
+      setAnalysisNote('');
+      goToPhase('observations');
+      return;
+    }
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
+    setAnalysisNote('');
+    setAnalysisError('');
+    setPhase('analyzing');
+    topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    (async () => {
+      let found = [];
+      let note = '';
+      try {
+        if (isVideo) {
+          note = 'Video analysis is not available yet. Continue with your own words below.';
+        } else if (!segmentationOn && !reasoningOn) {
+          note = 'AI suggestions are not connected. ProofPath did not analyze this image. Your words remain your own.';
+        } else {
+          let masksResult = [];
+          if (segmentationOn) {
+            try {
+              const result = await api.segment(file, controller.signal);
+              masksResult = result.masks || [];
+            } catch (error) {
+              if (error?.name === 'AbortError' || controller.signal.aborted) throw error;
+              if (error?.status === 401) throw error;
+              note = `Object outlines are unavailable right now (${error.message || 'segmentation failed'}). `;
+            }
+          } else {
+            note = 'Object outlines are not connected. ';
+          }
+          found = masksResult.map((mask, index) => observationFromMask(mask, index));
+          setMasks(masksResult);
+          if (reasoningOn && found.length > 0) {
+            const seed = `The photo shows ${found.map((item) => item.title).join(', ')}.`;
+            if (seed.length >= 10) {
+              try {
+                const assist = await api.assist(
+                  {
+                    observation: seed,
+                    title: title.trim() || null,
+                    category: category || null,
+                    location: location.trim() || null,
+                  },
+                  controller.signal,
+                );
+                if (assist && assist.provider !== 'unavailable' && assist.structured_description) {
+                  setAssistText(assist.structured_description);
+                  setAssistProvider(assist.provider || 'AI suggestion');
+                } else {
+                  note += 'Report wording help is unavailable right now. ';
+                  setAssistProvider('unavailable');
+                }
+              } catch (error) {
+                if (error?.name === 'AbortError' || controller.signal.aborted) throw error;
+                if (error?.status === 401) throw error;
+                note += 'Report wording help is unavailable right now. ';
+                setAssistProvider('unavailable');
+              }
+            }
+          } else if (!reasoningOn) {
+            note += 'Report wording help is not connected. ';
+          }
+          if (found.length === 0 && !note) note = 'No distinct objects found. Your description still matters most.';
+        }
+        if (phaseRef.current !== 'analyzing') return;
+        setObservations(found);
+        setShowOverlay(found.length > 0);
+        setAnalysisNote(note);
+        setPhase('ready');
+      } catch (error) {
+        if (error?.name === 'AbortError' || controller.signal.aborted) {
+          if (phaseRef.current === 'analyzing') setPhase('evidence');
+          return;
+        }
+        if (phaseRef.current !== 'analyzing') return;
+        if (error?.status === 401) {
+          // Session expired mid-analysis: stop protected requests, keep the
+          // autosaved draft, and explain sign-in is required. The draft is
+          // preserved, so signing in resumes without duplicates.
+          try {
+            sessionStorage.setItem('proofpath.sessionExpired', '1');
+          } catch {
+            // Storage failure must never break the reporting flow.
+          }
+          setSessionExpired(true);
+          setAnalysisError('');
+          setAnalysisNote('');
+          setPhase('evidence');
+          return;
+        }
+        setAnalysisError(error.message || 'Analysis failed. Try again.');
+        setPhase('evidence');
+      } finally {
+        if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
+      }
+    })();
+  }
+
+  function cancelAnalysis() {
+    if (analyzeAbortRef.current) analyzeAbortRef.current.abort();
+    setPhase('evidence');
+  }
+
+  function toggleObservation(id) {
+    setObservations((current) => current.map((item) => (item.id === id ? { ...item, selected: !item.selected } : item)));
+  }
+
+  function addCustomObservation() {
+    const trimmedTitle = customTitle.trim();
+    const trimmedBody = customBody.trim();
+    if (trimmedTitle.length < 3 || trimmedBody.length < 10) return;
+    const nextId = padNumber(observations.length + 1);
+    setObservations((current) => [...current, { id: nextId, title: trimmedTitle, body: trimmedBody, selected: true }]);
+    setCustomTitle('');
+    setCustomBody('');
+  }
+
+  function confirmObservations() {
+    if (!titleDirty && checked.length > 0) setTitle(checked[0].title);
+    if (!descriptionDirty) {
+      const composed = composeDescription(checked, location.trim(), assistText);
+      setDescription(composed);
+    }
+    goToPhase('details');
   }
 
   async function prepareEvidence() {
-    if (!file.type.startsWith('image/')) return file;
+    if (!file) throw new Error('Add a photo or video as evidence.');
+    if (!needsPrivacyPrepare()) return file;
     await photoReadyRef.current;
-    if (!stripMetadata && redactionPathsRef.current.length === 0) return file;
+    const canvas = renderPrivacyCanvas();
+    if (!canvas) throw new Error('The privacy-prepared image could not be created.');
     const blob = await new Promise((resolve) => {
-      canvasRef.current.toBlob(resolve, file.type, 0.92);
+      canvas.toBlob(resolve, file.type, 0.92);
     });
     if (!blob) throw new Error('The privacy-prepared image could not be created.');
     return new File([blob], file.name, { type: blob.type, lastModified: Date.now() });
   }
 
-  function goToStep(next) {
-    setStep(next);
-    topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
-  function goNext(next) {
-    const section = sectionRefs.current[step];
-    const invalid = section
-      ? [...section.querySelectorAll('input[required], select[required], textarea[required]')].find((field) => !field.checkValidity())
-      : null;
-    if (invalid) {
-      invalid.reportValidity();
-      return;
-    }
-    goToStep(next);
-  }
-
-  async function runSegmentation() {
-    if (!file) {
-      setSegmentMessage('Choose a photo first.');
-      return;
-    }
-    if (file.type.startsWith('video/')) {
-      setSegmentMessage('Outlines support photos only.');
-      return;
-    }
-    setSegmentBusy(true);
-    setSegmentMessage('Finding objects…');
-    try {
-      await photoReadyRef.current;
-      if (!loadedPhotoRef.current) throw new Error('The photo preview is not ready yet.');
-      const result = await api.segment(file);
-      const masks = result.masks || [];
-      setSegmentMasks(masks);
-      if (masks.length === 0) {
-        setSegmentsVisible(false);
-        setSegmentMessage('No distinct objects found. Your description still matters most.');
-        return;
-      }
-      setSegmentsVisible(true);
-      setSegmentMessage(`${masks.length} region${masks.length === 1 ? '' : 's'} outlined. Verify each one against the photo.`);
-    } catch (error) {
-      setSegmentMessage(error.message || 'Segmentation failed.');
-    } finally {
-      setSegmentBusy(false);
-    }
-  }
-
-  useEffect(() => {
-    if (segmentsVisible && segmentMasks.length > 0) drawSegments(segmentMasks);
-  }, [segmentsVisible, segmentMasks]);
-
-  function drawSegments(masks) {
-    const photo = loadedPhotoRef.current;
-    const canvas = segmentCanvasRef.current;
-    if (!photo || !canvas) return;
-    const scale = Math.min(1, 1200 / Math.max(photo.naturalWidth, photo.naturalHeight));
-    canvas.width = Math.round(photo.naturalWidth * scale);
-    canvas.height = Math.round(photo.naturalHeight * scale);
-    const context = canvas.getContext('2d');
-    context.drawImage(photo, 0, 0, canvas.width, canvas.height);
-    context.lineWidth = Math.max(2, canvas.width * 0.004);
-    context.font = `${Math.max(12, Math.round(canvas.width * 0.022))}px sans-serif`;
-    for (const mask of masks) {
-      const [x, y, w, h] = mask.bbox;
-      const left = x * canvas.width;
-      const top = y * canvas.height;
-      const width = w * canvas.width;
-      const height = h * canvas.height;
-      context.strokeStyle = '#244d3c';
-      context.strokeRect(left, top, width, height);
-      context.fillStyle = 'rgba(36, 77, 60, 0.85)';
-      const label = `${mask.label} ${Math.round((mask.score || 0) * 100)}%`;
-      const textWidth = context.measureText(label).width;
-      context.fillRect(left, Math.max(0, top - 22), textWidth + 12, 22);
-      context.fillStyle = '#ffffff';
-      context.fillText(label, left + 6, Math.max(15, top - 6));
-    }
-  }
-
-  async function runAssist() {
-    const observation = description.trim();
-    if (observation.length < 10) {
-      descriptionRef.current?.focus();
-      descriptionRef.current?.reportValidity();
-      return;
-    }
-    setAssistBusy(true);
-    try {
-      const result = await api.assist({
-        observation,
-        title: title.trim() || null,
-        category: category || null,
-        location: location.trim() || null,
-      });
-      setAssist(result);
-    } catch (error) {
-      setAssist({ provider: 'unavailable', structured_description: error.message || 'Report help failed.', missing_info: [], followup_questions: [], note: '' });
-    } finally {
-      setAssistBusy(false);
-    }
-  }
-
-  async function onSubmit(event) {
+  async function onSave(event) {
     event.preventDefault();
     if (!formRef.current.reportValidity()) return;
     if (!file) {
       setEvidenceError('Add a photo or video as evidence.');
-      goToStep(1);
+      goToPhase('evidence');
+      return;
+    }
+    if (missingDetails.length > 0) {
+      setFormMessage(`Still needed: ${missingDetails.join(', ')}.`);
+      setFormError(true);
+      goToPhase('details');
       return;
     }
     setSubmitBusy(true);
     setFormMessage('');
     setFormError(false);
+    setSessionExpired(false);
+    // Function-scoped so the catch block can tell a pre-create expiry
+    // apart from the narrow create-then-expire race below.
+    let created = null;
     try {
+      // Validate the session BEFORE creating anything: a 401 here means the
+      // account cannot be billed for a report, so nothing is created and the
+      // draft simply waits for sign-in. This also closes the partial-create
+      // race (create succeeds, edit 401s) for the common expiry case.
+      try {
+        await api.trySession();
+      } catch (error) {
+        if (error?.status === 401) throw error;
+        throw error;
+      }
       const prepared = await prepareEvidence();
       const data = new FormData();
       data.append('title', title.trim());
@@ -308,84 +607,106 @@ export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
       data.append('description', description.trim());
       if (location.trim()) data.append('location', location.trim());
       data.append('evidence', prepared, prepared.name);
-      const report = await api.createReport(data);
-      onSaved(report, file);
+      try {
+        created = await api.createReport(data, { loginRedirect: false });
+      } catch (error) {
+        if (error?.status === 401) throw error;
+        throw error;
+      }
+      let final = null;
+      try {
+        final = await api.editReport(created.id, {
+          title: title.trim(),
+          category,
+          description: description.trim(),
+          location: location.trim() || null,
+          observed_date: observedDate || null,
+          resident_context: residentContext.trim() || null,
+          observations: observations.map((item) => ({ id: item.id, title: item.title, body: item.body, selected: item.selected })),
+        }, { loginRedirect: false });
+      } catch (error) {
+        if (error?.status === 401 && created?.id) {
+          // Narrow race: the report was created, then the session died
+          // before details saved. Remember the id so resume opens the
+          // existing report instead of saving a duplicate.
+          try {
+            sessionStorage.setItem('proofpath.pendingCreated', String(created.id));
+          } catch {
+            // Storage failure must never break the reporting flow.
+          }
+          throw error;
+        }
+        throw error;
+      }
+      onSaved(final, prepared);
     } catch (error) {
-      setFormMessage(error.message || 'Something went wrong. Please try again.');
-      setFormError(true);
+      if (error?.status === 401) {
+        try {
+          sessionStorage.setItem('proofpath.sessionExpired', '1');
+        } catch {
+          // Storage failure must never break the reporting flow.
+        }
+        setSessionExpired(true);
+        setFormMessage(created ? 'Your report was received. Sign in to continue to it — nothing was duplicated.' : 'Your session expired. Please sign in to continue — your draft is preserved.');
+        setFormError(true);
+      } else {
+        setFormMessage(error?.message || 'Something went wrong. Please try again.');
+        setFormError(true);
+      }
     } finally {
       setSubmitBusy(false);
     }
   }
 
-  const reviewMeta = [category, location.trim()].filter(Boolean).join(' · ') || 'Report details';
+  const stepIndex = phase === 'observations' ? 1 : phase === 'details' ? 2 : phase === 'review' ? 3 : 0;
+  const phaseTitle =
+    phase === 'analyzing'
+      ? ['Analyzing evidence', 'Preparing suggestions from your selected photo.']
+      : phase === 'ready'
+        ? ['Ready to review', 'Choose which observations belong in your report.']
+        : phase === 'observations'
+          ? ['Review observations', 'Select the observations to include in your report.']
+          : phase === 'details'
+            ? ['Add report details', 'Confirm the location and add context.']
+            : phase === 'review'
+              ? ['Review report', 'Check the details before saving.']
+              : evidenceError
+                ? ['Upload failed', 'Choose another image to continue.']
+                : ['Upload evidence', 'Add a clear photo of the issue.'];
 
-  function renderPreview(target) {
-    if (file && previewUrl) {
-      if (file.type.startsWith('video/')) {
-        return <video src={previewUrl} controls playsInline />;
-      }
-      return <img src={previewUrl} alt={target === 'observation' ? 'Selected evidence preview' : 'Evidence preview'} />;
-    }
-    return <span>Evidence preview</span>;
-  }
+  const privacySummary = `Photo metadata: ${stripMetadata ? 'remove' : 'keep'}; Identifying details: ${blurDetails ? 'blur' : 'keep'}`;
+  const observedLong = formatLongDate(observedDate);
+  const reviewMeta = [category, observedLong ? `Observed ${observedLong}` : null].filter(Boolean).join(' · ') || 'Report details';
+  const attachmentLabel = file ? (isVideo ? '1 video' : '1 photo') : 'No evidence';
+  const confirmLabel = `${attachmentLabel} · ${checked.length} confirmed observation${checked.length === 1 ? '' : 's'}`;
 
   return (
-    <section className="report-compose" aria-labelledby="compose-heading" ref={topRef}>
-      <div className="wizard-heading">
-        <div>
-          <p className="eyebrow">NEW COMMUNITY REPORT</p>
-          <h1 id="compose-heading">Start with what you saw</h1>
-        </div>
-        <button className="wizard-close" type="button" aria-label="Return to reports" onClick={onCancel}>
-          ×
-        </button>
-      </div>
-      <ol className="wizard-progress" aria-label="Report steps">
-        {STEP_LABELS.map((label, index) => {
-          const number = index + 1;
-          const current = number === step;
+    <section className="w-flow" aria-labelledby="w-heading" ref={topRef}>
+      <h1 id="w-heading">{phaseTitle[0]}</h1>
+      <p className="w-sub">{phaseTitle[1]}</p>
+      <ol className="w-stepper" aria-label="Report steps">
+        {STEPS.map((label, index) => {
+          const done = index < stepIndex;
+          const active = index === stepIndex;
           return (
-            <li key={label} className={`${current ? 'is-current' : ''} ${number < step ? 'is-complete' : ''}`.trim()} aria-current={current ? 'step' : undefined}>
-              <span>{String(number).padStart(2, '0')}</span>
-              <span>{label}</span>
+            <li key={label} className={`${done ? 'is-done' : ''} ${active ? 'is-active' : ''}`.trim()} aria-current={active ? 'step' : undefined}>
+              <span className="w-node" aria-hidden="true">{done ? '✓' : index + 1}</span>
+              <span className="w-step-label">{label}</span>
             </li>
           );
         })}
       </ol>
 
-      <form ref={formRef} onSubmit={onSubmit}>
-        <section className="wizard-page" aria-labelledby="evidence-heading" ref={(el) => { sectionRefs.current[1] = el; }} hidden={step !== 1}>
-            <div className="wizard-page-heading">
-              <span className="step-kicker">STEP 1 OF 4</span>
-              <h2 id="evidence-heading">Add evidence</h2>
-              <p>Choose a clear photo or video of the issue.</p>
-            </div>
-            <div className="field-group">
-              <label className="field-label" htmlFor="evidence">
-                Photo or video <span className="optional">Required</span>
-              </label>
+      <form ref={formRef} onSubmit={onSave}>
+        {(phase === 'evidence') && (
+          <>
+            {!file && !evidenceError && (
               <label
-                className={`upload-zone${dragging ? ' is-dragging' : ''}`}
-                htmlFor="evidence"
-                onDragEnter={(event) => {
-                  event.preventDefault();
-                  setDragging(true);
-                }}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  setDragging(true);
-                }}
-                onDragLeave={(event) => {
-                  event.preventDefault();
-                  setDragging(false);
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setDragging(false);
-                  const [dropped] = event.dataTransfer.files;
-                  if (dropped) acceptFile(dropped);
-                }}
+                className={`w-dropzone${dragging ? ' is-dragging' : ''}`}
+                onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+                onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+                onDragLeave={(event) => { event.preventDefault(); setDragging(false); }}
+                onDrop={(event) => { event.preventDefault(); setDragging(false); const [dropped] = event.dataTransfer.files; if (dropped) acceptFile(dropped); }}
               >
                 <input
                   id="evidence"
@@ -393,362 +714,526 @@ export default function Wizard({ aiStatus, canCreate, onSaved, onCancel }) {
                   type="file"
                   ref={fileInputRef}
                   accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime"
-                  required={!file}
                   onChange={(event) => acceptFile(event.target.files[0])}
                 />
-                {!file && (
-                  <span className="upload-content">
-                    <span className="upload-icon" aria-hidden="true">
-                      +
-                    </span>
-                    <span className="upload-title">Drop a photo or video here</span>
-                    <span className="upload-hint">JPG, PNG, WebP, MP4, or MOV · up to 20 MB</span>
-                    <span className="browse-link">Choose a file</span>
-                  </span>
-                )}
-                {file && (
-                  <span className="preview-wrap">
-                    {!isVideo && (
-                      <canvas
-                        ref={canvasRef}
-                        aria-label="Evidence preview. Mark areas to blur identifying details."
-                        className={blurActive ? 'is-blur-active' : ''}
-                        onPointerDown={(event) => {
-                          if (!blurActiveRef.current || !loadedPhotoRef.current) return;
-                          event.preventDefault();
-                          event.stopPropagation();
-                          event.currentTarget.setPointerCapture(event.pointerId);
-                          const path = [imagePoint(event)];
-                          activeRedactionRef.current = path;
-                          redactionPathsRef.current.push(path);
-                          drawPhotoPreview();
-                        }}
-                        onPointerMove={(event) => {
-                          if (!activeRedactionRef.current) return;
-                          activeRedactionRef.current.push(imagePoint(event));
-                          drawPhotoPreview();
-                        }}
-                        onPointerUp={() => {
-                          activeRedactionRef.current = null;
-                        }}
-                        onPointerCancel={() => {
-                          activeRedactionRef.current = null;
-                        }}
-                        onClick={(event) => {
-                          if (blurActiveRef.current) {
-                            event.preventDefault();
-                            event.stopPropagation();
-                          }
-                        }}
-                      />
-                    )}
-                    {isVideo && <video ref={videoRef} src={previewUrl} controls playsInline />}
-                    <span className="preview-change">Choose a different file</span>
-                  </span>
-                )}
+                <span className="w-drop-title">Drop a photo here</span>
+                <span className="w-drop-hint">JPG or PNG</span>
+                <span className="w-drop-types">WebP and video (MP4, MOV) also accepted · up to 20 MB</span>
+                <span className="w-choose" aria-hidden="true">Choose a photo</span>
               </label>
-              {file && !isVideo && (
-                <div className="privacy-tools">
-                  <div className="privacy-heading">
-                    <strong>Your evidence, protected</strong>
-                    <span>Privacy settings</span>
-                  </div>
-                  <div className="privacy-toolbar">
-                    <label className="privacy-option" htmlFor="strip-metadata">
-                      <input id="strip-metadata" type="checkbox" checked={stripMetadata} onChange={(event) => setStripMetadata(event.target.checked)} /> Remove photo metadata
-                    </label>
-                    <button
-                      className="privacy-tool"
-                      type="button"
-                      aria-pressed={String(blurActive)}
-                      onClick={() => {
-                        setBlurActive((value) => {
-                          const next = !value;
-                          setPrivacyHelp(next ? 'Drag over faces, plates, or other identifying details to blur them.' : 'Blurred areas are included in the saved evidence image.');
-                          return next;
-                        });
+            )}
+            {!file && evidenceError && (
+              <div className="w-dropzone is-error" role="alert">
+                <p className="w-error-title">We could not read that file</p>
+                <p className="w-error-sub">Choose a clear JPG or PNG photo to try again.</p>
+                <button
+                  className="w-choose"
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  Choose another photo
+                </button>
+                <input
+                  id="evidence"
+                  name="evidence"
+                  type="file"
+                  ref={fileInputRef}
+                  accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime"
+                  hidden
+                  onChange={(event) => acceptFile(event.target.files[0])}
+                />
+              </div>
+            )}
+            {file && (
+              <div className="w-evidence-card">
+                <div className="w-evidence-media">
+                  {!isVideo && (
+                    <canvas
+                      ref={canvasRef}
+                      aria-label={blurDetails ? 'Evidence photo. Drag to blur identifying details.' : 'Selected evidence photo'}
+                      className={`w-blur-canvas${blurDetails ? ' is-active' : ''}`}
+                      onPointerDown={(event) => {
+                        if (!blurDetails || !loadedPhotoRef.current) return;
+                        event.preventDefault();
+                        event.currentTarget.setPointerCapture(event.pointerId);
+                        const path = [imagePoint(event)];
+                        activeRedactionRef.current = path;
+                        redactionPathsRef.current.push(path);
+                        drawPhotoPreview();
+                        refreshDisplayPreview();
                       }}
-                    >
-                      {blurActive ? 'Done marking details' : 'Mark details to blur'}
+                      onPointerMove={(event) => {
+                        if (!activeRedactionRef.current) return;
+                        activeRedactionRef.current.push(imagePoint(event));
+                        drawPhotoPreview();
+                      }}
+                      onPointerUp={() => { activeRedactionRef.current = null; refreshDisplayPreview(); }}
+                      onPointerCancel={() => { activeRedactionRef.current = null; refreshDisplayPreview(); }}
+                    />
+                  )}
+                  {isVideo && previewUrl && <video src={previewUrl} controls playsInline />}
+                </div>
+                <div className="w-evidence-info">
+                  <h2 className="w-filename">{file.name}</h2>
+                  <p className="w-ready">Ready to analyze</p>
+                  <p className="w-stays">Your photo will stay attached to the report.</p>
+                  <div className="w-evidence-buttons">
+                    <button className="w-choose" type="button" onClick={() => fileInputRef.current?.click()}>
+                      Choose another photo
                     </button>
-                    <button className="privacy-tool privacy-tool-quiet" type="button" onClick={clearRedactions}>
-                      Clear marks
+                    <input
+                      type="file"
+                      ref={fileInputRef}
+                      accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime"
+                      hidden
+                      onChange={(event) => acceptFile(event.target.files[0])}
+                    />
+                    <button className="w-link" type="button" onClick={removePhoto}>
+                      Remove photo
                     </button>
                   </div>
-                  <p>{privacyHelp}</p>
+                  {!isVideo && blurDetails && (
+                    <p className="w-blur-row">
+                      <span>{blurHint}</span>
+                      <button className="w-link" type="button" onClick={clearRedactions}>
+                        Clear blur marks
+                      </button>
+                    </p>
+                  )}
                 </div>
-              )}
-              <p className="privacy-disclaimer">Photos are re-encoded only if metadata removal or blurring is selected. Video metadata is not modified.</p>
-              <p className="field-error" aria-live="polite">
-                {evidenceError}
-              </p>
-            </div>
-            <div className="wizard-actions">
-              <button className="text-link back-to-journal" type="button" onClick={onCancel}>
+              </div>
+            )}
+            <PrivacyCard
+              stripMetadata={stripMetadata}
+              onStripChange={setStripMetadata}
+              blurDetails={blurDetails}
+              onBlurChange={setBlurDetails}
+              disabled={isVideo}
+            />
+            {isVideo && (
+              <p className="w-video-note">Video files are attached unchanged. Metadata removal and blurring apply to photos only.</p>
+            )}
+            {analysisError && (
+              <p className="w-form-error" role="alert">{analysisError}</p>
+            )}
+            <div className="w-foot">
+              <button className="w-link" type="button" onClick={onCancel}>
                 Back to reports
               </button>
-              <button className="submit-button" type="button" onClick={() => goNext(2)}>
-                Continue <span aria-hidden="true">→</span>
+              <button className="w-primary" type="button" disabled={!file} onClick={startAnalysis}>
+                Analyze photo <span aria-hidden="true">→</span>
               </button>
             </div>
-        </section>
+          </>
+        )}
 
-        <section className="wizard-page" aria-labelledby="observation-heading" ref={(el) => { sectionRefs.current[2] = el; }} hidden={step !== 2}>
-            <div className="wizard-page-heading">
-              <span className="step-kicker">STEP 2 OF 4</span>
-              <h2 id="observation-heading">Review your observation</h2>
-              <p>Describe only what you can personally verify from the evidence.</p>
-            </div>
-            <div className="observation-note">
-              <span className="notice-mark" aria-hidden="true">
-                i
+        {phase === 'analyzing' && (
+          <>
+            <div className="w-status-card">
+              <span className="w-status-icon" aria-hidden="true">
+                <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+                  <circle cx="11" cy="11" r="9" stroke="currentColor" strokeWidth="1.6" />
+                  <path d="M11 6.5V11l3 2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                </svg>
               </span>
-              <p>
-                {!aiStatus && (
-                  <>
-                    <strong>AI status unavailable.</strong> Your words remain your own; please avoid guessing at cause or severity.
-                  </>
-                )}
-                {aiStatus && !segmentationOn && !reasoningOn && (
-                  <>
-                    <strong>AI suggestions are not connected.</strong> ProofPath does not analyze this image. Your words remain your own; please avoid
-                    guessing at cause or severity.
-                  </>
-                )}
-                {aiStatus && (segmentationOn || reasoningOn) && (
-                  <>
-                    <strong>
-                      AI connected: {[segmentationOn && 'object outlines', reasoningOn && 'report wording help'].filter(Boolean).join(' and ')}.
-                    </strong>{' '}
-                    Suggestions are unverified — your words remain your own; please avoid guessing at cause or severity.
-                  </>
-                )}
-              </p>
+              <h2>Analyzing your photo…</h2>
+              <p>Keep this page open while we prepare observations.</p>
             </div>
-            <div className="observation-layout">
-              <div className="observation-evidence">
-                <div className="privacy-heading">
-                  <strong>Your evidence</strong>
-                  <span>Photo preview</span>
-                </div>
-                <div className="summary-media">{renderPreview('observation')}</div>
-                <div className="ai-segment-row">
-                  <button className="privacy-tool" type="button" disabled={!canCreate || !segmentationOn || segmentBusy} title={!segmentationOn ? 'Segmentation is not configured.' : ''} onClick={runSegmentation}>
-                    Find objects in photo
-                  </button>
-                  {segmentMasks.length > 0 && (
-                    <button className="privacy-tool privacy-tool-quiet" type="button" onClick={() => setSegmentsVisible((value) => !value)}>
-                      {segmentsVisible ? 'Hide outlines' : 'Show outlines'}
+            <p className="w-privacy-line">
+              <strong>Privacy options</strong>
+              <span>{privacySummary}</span>
+            </p>
+            <div className="w-foot">
+              <button className="w-link" type="button" onClick={cancelAnalysis}>
+                Cancel
+              </button>
+              <button className="w-primary" type="button" disabled>
+                Analyzing photo…
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'ready' && (
+          <>
+            <div className="w-status-card">
+              <span className="w-status-icon is-ok" aria-hidden="true">✓</span>
+              <h2>Your photo is ready to review</h2>
+              <p>{`${observations.length} suggestion${observations.length === 1 ? '' : 's'} found. You decide what to include.`}</p>
+              {analysisNote && <p className="w-note">{analysisNote}</p>}
+            </div>
+            <p className="w-privacy-line">
+              <strong>Privacy options</strong>
+              <span>{privacySummary}</span>
+            </p>
+            <div className="w-foot">
+              <button className="w-link" type="button" onClick={() => goToPhase('evidence')}>
+                Back to photo
+              </button>
+              <button className="w-primary" type="button" onClick={() => goToPhase('observations')}>
+                Review observations <span aria-hidden="true">→</span>
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'observations' && (
+          <>
+            <AiBanner aiStatus={aiStatus} segmentationOn={segmentationOn} reasoningOn={reasoningOn} />
+            <div className="w-obs-layout">
+              <div className="w-photo-card">
+                <div className="w-photo-head">
+                  <span className="w-photo-title">▦ Photo 01</span>
+                  {masks.length > 0 && (
+                    <button className="w-link" type="button" onClick={() => setShowOverlay((value) => !value)}>
+                      {showOverlay ? 'View original' : 'View overlay'}
                     </button>
                   )}
                 </div>
-                <p className="field-hint">{segmentMessage}</p>
-                {segmentsVisible && segmentMasks.length > 0 && (
-                  <div id="segment-result">
-                    <canvas ref={segmentCanvasRef} aria-label="Photo with AI outlines" />
-                    <div className="segment-labels">
-                      {segmentMasks.map((mask, index) => (
-                        <span key={index}>
-                          {mask.label} · {Math.round((mask.score || 0) * 100)}%
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                <p className="field-hint">Review the image as you write your observation.</p>
-              </div>
-              <div className="field-group observation-field">
-                <label className="field-label" htmlFor="description">
-                  What did you observe? <span className="optional">Required · 10–2000 characters</span>
-                </label>
-                <textarea
-                  id="description"
-                  name="description"
-                  ref={descriptionRef}
-                  minLength={10}
-                  maxLength={2000}
-                  rows={7}
-                  placeholder="Describe what you can see, when you noticed it, and how it affects the area."
-                  required
-                  value={description}
-                  onChange={(event) => setDescription(event.target.value)}
-                />
-                <span className="character-count">{description.length} / 2000</span>
-                <button className="secondary-action assist-button" type="button" disabled={!canCreate || assistBusy} onClick={runAssist}>
-                  {assistBusy ? 'Getting help…' : 'Get report help'}
-                </button>
-                {assist && (
-                  <div className="ai-assist">
-                    <div className="privacy-heading">
-                      <strong>Suggested wording</strong>
-                      <span>{assist.provider === 'local-fallback' ? 'Local checklist' : assist.provider === 'unavailable' ? 'Unavailable' : 'AI suggestion'}</span>
-                    </div>
-                    <p>{assist.structured_description}</p>
-                    {assist.provider !== 'unavailable' && (
-                      <div className="assist-actions">
-                        <button
-                          className="privacy-tool"
-                          type="button"
-                          onClick={() => {
-                            setDescription(assist.structured_description);
-                            setAssist(null);
-                            descriptionRef.current?.focus();
-                          }}
-                        >
-                          Use suggestion
-                        </button>
-                        <button className="privacy-tool privacy-tool-quiet" type="button" onClick={() => setAssist(null)}>
-                          Keep my words
-                        </button>
-                      </div>
-                    )}
-                    <div>
-                      {[...(assist.missing_info || []), ...(assist.followup_questions || [])].map((item, index) => (
-                        <p key={index}>• {item}</p>
-                      ))}
-                      {assist.suggested_category && (
-                        <p>
-                          Suggested category: {assist.suggested_category}{' '}
-                          <button
-                            type="button"
-                            className="privacy-tool"
-                            onClick={() => {
-                              setCategory(assist.suggested_category);
-                            }}
-                          >
-                            Use category
-                          </button>
-                        </p>
-                      )}
-                    </div>
-                    <p className="field-hint">{assist.note || ''}</p>
-                  </div>
-                )}
-                <p className="field-hint">Only checked observations appear in your report—here, that means only the details you choose to write.</p>
-              </div>
-            </div>
-            <div className="wizard-actions">
-              <button className="text-link" type="button" onClick={() => goToStep(1)}>
-                ← Back to evidence
-              </button>
-              <button className="submit-button" type="button" onClick={() => goNext(3)}>
-                Continue <span aria-hidden="true">→</span>
-              </button>
-            </div>
-        </section>
-
-        <section className="wizard-page" aria-labelledby="details-heading" ref={(el) => { sectionRefs.current[3] = el; }} hidden={step !== 3}>
-            <div className="wizard-page-heading">
-              <span className="step-kicker">STEP 3 OF 4</span>
-              <h2 id="details-heading">Add report details</h2>
-              <p>Confirm the location and add context that only you know.</p>
-            </div>
-            <div className="details-layout">
-              <div className="details-fields">
-                <div className="field-group">
-                  <label className="field-label" htmlFor="title">
-                    Short title <span className="optional">Required</span>
-                  </label>
-                  <input id="title" name="title" minLength={3} maxLength={120} placeholder="e.g. Uneven road surface near the footbridge" required value={title} onChange={(event) => setTitle(event.target.value)} />
+                <div className="w-overlay-wrap">
+                  {(displayUrl || previewUrl) && !isVideo && (
+                    <img src={displayUrl || previewUrl} alt="Evidence with observation outlines" />
+                  )}
+                  {(displayUrl || previewUrl) && isVideo && <video src={displayUrl || previewUrl} controls playsInline />}
+                  {showOverlay && masks.length > 0 && !isVideo && masks.map((mask, index) => {
+                    const [x, y, w, h] = mask.bbox || [0, 0, 0, 0];
+                    return (
+                      <span
+                        key={index}
+                        className="w-region"
+                        style={{
+                          left: `${x * 100}%`,
+                          top: `${y * 100}%`,
+                          width: `${w * 100}%`,
+                          height: `${h * 100}%`,
+                          backgroundColor: OVERLAY_FILLS[index % OVERLAY_FILLS.length],
+                        }}
+                      >
+                        <span className="w-chip">{padNumber(index + 1)}</span>
+                      </span>
+                    );
+                  })}
                 </div>
-                <div className="form-grid">
-                  <div className="field-group">
-                    <label className="field-label" htmlFor="category">
-                      Issue type
-                    </label>
-                    <select id="category" name="category" required value={category} onChange={(event) => setCategory(event.target.value)}>
-                      <option value="" disabled>
-                        Select a category
-                      </option>
+                <p className="w-photo-foot">
+                  <span>{file ? file.name : ''}</span>
+                  {showOverlay && masks.length > 0 && !isVideo && <span>Numbers match the suggestions.</span>}
+                </p>
+              </div>
+              <div className="w-suggest">
+                <div className="w-suggest-head">
+                  <h2>Suggested observations</h2>
+                  <span>{`${checked.length} observation${checked.length === 1 ? '' : 's'} selected`}</span>
+                </div>
+                <p className="w-suggest-sub">Only checked observations appear in your report.</p>
+                {observations.length === 0 && (
+                  <p className="w-empty-obs">No suggestions for this photo yet. Add your own observation below — only checked observations appear in your report.</p>
+                )}
+                <ul className="w-obs-list">
+                  {observations.map((item) => (
+                    <li key={item.id} className={`w-obs${item.selected ? ' is-checked' : ''}`}>
+                      <label>
+                        <input type="checkbox" checked={item.selected} onChange={() => toggleObservation(item.id)} />
+                        <span className="w-obs-id">{item.id}</span>
+                        <span className="w-obs-text">
+                          <strong>{item.title}</strong>
+                          <span>{item.body}</span>
+                        </span>
+                        <span className="w-box" aria-hidden="true">{item.selected ? '✓' : ''}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+                <div className="w-custom-obs">
+                  <h3>Add your own observation</h3>
+                  <label className="w-field">
+                    <span>Title</span>
+                    <input value={customTitle} maxLength={120} placeholder="e.g. Blocked drain inlet" onChange={(event) => setCustomTitle(event.target.value)} />
+                  </label>
+                  <label className="w-field">
+                    <span>What did you see? (10+ characters)</span>
+                    <textarea value={customBody} maxLength={2000} rows={3} placeholder="Describe only what you can verify from the evidence." onChange={(event) => setCustomBody(event.target.value)} />
+                  </label>
+                  <button className="w-secondary" type="button" disabled={customTitle.trim().length < 3 || customBody.trim().length < 10} onClick={addCustomObservation}>
+                    Add observation
+                  </button>
+                </div>
+                {assistText && (
+                  <div className="w-assist">
+                    <p className="w-assist-head">
+                      <strong>Suggested wording</strong>
+                      <span>{assistProvider === 'unavailable' ? 'Unavailable' : assistProvider || 'AI suggestion'}</span>
+                    </p>
+                    <p>{assistText}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="w-foot">
+              <button className="w-link" type="button" onClick={() => goToPhase('evidence')}>
+                Back to evidence
+              </button>
+              <button className="w-primary" type="button" onClick={confirmObservations}>
+                Confirm &amp; continue <span aria-hidden="true">→</span>
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'details' && (
+          <>
+            <div className="w-details-layout">
+              <div className="w-details-form">
+                <label className="w-field">
+                  <span>Short title *</span>
+                  <input
+                    name="title"
+                    minLength={3}
+                    maxLength={120}
+                    required
+                    placeholder="e.g. Uneven road surface near the footbridge"
+                    value={title}
+                    onChange={(event) => { setTitle(event.target.value); setTitleDirty(true); }}
+                  />
+                </label>
+                <label className="w-field">
+                  <span>Where is the issue? *</span>
+                  <input
+                    name="location"
+                    maxLength={180}
+                    required
+                    placeholder="Mabini Street, near the footbridge"
+                    value={location}
+                    onChange={(event) => setLocation(event.target.value)}
+                  />
+                </label>
+                <div className="w-field-row">
+                  <label className="w-field">
+                    <span>Issue category *</span>
+                    <select name="category" required value={category} onChange={(event) => setCategory(event.target.value)}>
+                      <option value="" disabled>Select a category</option>
                       {CATEGORIES.map((option) => (
-                        <option key={option}>{option}</option>
+                        <option key={option} value={option}>{option}</option>
                       ))}
                     </select>
-                  </div>
-                  <div className="field-group">
-                    <label className="field-label" htmlFor="location">
-                      Location <span className="optional">Optional</span>
-                    </label>
-                    <input id="location" name="location" maxLength={180} placeholder="Street or nearby landmark" value={location} onChange={(event) => setLocation(event.target.value)} />
-                  </div>
+                  </label>
+                  <label className="w-field">
+                    <span>When did you notice it?</span>
+                    <input
+                      name="observed_date"
+                      type="date"
+                      value={observedDate}
+                      max={new Date().toISOString().slice(0, 10)}
+                      onChange={(event) => setObservedDate(event.target.value)}
+                    />
+                  </label>
                 </div>
+                <label className="w-field">
+                  <span>What else should someone know?</span>
+                  <textarea
+                    name="resident_context"
+                    rows={4}
+                    maxLength={2000}
+                    placeholder="I noticed this area while walking near the footbridge this morning. The affected surface is on the road beside the pedestrian crossing."
+                    value={residentContext}
+                    onChange={(event) => setResidentContext(event.target.value)}
+                  />
+                </label>
+                <p className="w-hint">Include only what you observed.</p>
+                <label className="w-field">
+                  <span>Description *</span>
+                  <textarea
+                    name="description"
+                    rows={4}
+                    minLength={10}
+                    maxLength={2000}
+                    required
+                    placeholder="Describe the issue for the report. Review all suggested wording before saving."
+                    value={description}
+                    onChange={(event) => { setDescription(event.target.value); setDescriptionDirty(true); }}
+                  />
+                </label>
               </div>
-              <aside className="evidence-summary">
-                <p className="eyebrow">YOUR EVIDENCE</p>
-                <div className="summary-media">{renderPreview('details')}</div>
-                <p className="summary-evidence-name">{file ? file.name : ''}</p>
-                <p className="summary-evidence-state">Privacy choices stay under your control.</p>
+              <aside className="w-evidence-side">
+                <h2>Your evidence</h2>
+                <div className="w-side-media">
+                  {(displayUrl || previewUrl) && !isVideo && <img src={displayUrl || previewUrl} alt="Evidence thumbnail" />}
+                  {(displayUrl || previewUrl) && isVideo && <video src={displayUrl || previewUrl} controls playsInline />}
+                </div>
+                <p className="w-side-row">
+                  <strong>{attachmentLabel}</strong>
+                  <span className="w-pill">Reviewed</span>
+                </p>
+                <p className="w-side-count">{`${checked.length} observation${checked.length === 1 ? '' : 's'} selected`}</p>
               </aside>
             </div>
-            <div className="completion-check">
-              <div className="completion-heading">
-                <span className="field-label">Required details</span>
-                <span className="completion-count">
-                  {completeCount} of 4 complete
-                </span>
-              </div>
-              <progress max={4} value={completeCount} aria-label="Required report details completed" />
-            </div>
-            <div className="wizard-actions">
-              <button className="text-link" type="button" onClick={() => goToStep(2)}>
-                ← Back to observation
+            <div className="w-foot">
+              <button className="w-link" type="button" onClick={() => goToPhase('observations')}>
+                Back to observations
               </button>
-              <button className="submit-button" type="button" onClick={() => goNext(4)}>
+              <button className="w-primary" type="button" onClick={() => goToPhase('review')}>
                 Preview report <span aria-hidden="true">→</span>
               </button>
             </div>
-        </section>
+          </>
+        )}
 
-        <section className="wizard-page" aria-labelledby="review-heading" ref={(el) => { sectionRefs.current[4] = el; }} hidden={step !== 4}>
-            <div className="wizard-page-heading">
-              <span className="step-kicker">STEP 4 OF 4</span>
-              <h2 id="review-heading">Review your report</h2>
-              <p>Check the details before saving.</p>
-            </div>
-            <div className="review-layout">
-              <article className="review-document">
-                <h3>{title.trim() || 'Untitled report'}</h3>
-                <p className="review-meta">{reviewMeta}</p>
-                <div className="review-divider"></div>
-                <h4>Description</h4>
+        {phase === 'review' && (
+          <>
+            <div className="w-review-layout">
+              <article className="w-review-doc">
+                <h2>{title.trim() || 'Untitled report'}</h2>
+                <p className="w-review-meta">{reviewMeta}</p>
+                <div className="w-rule" />
+                <h3>Description</h3>
                 <p>{description.trim()}</p>
-                <div className="review-divider"></div>
-                <div className="review-evidence-block">
-                  <div className="summary-media">{renderPreview('review')}</div>
-                  <p>{file ? `${file.name} · ${(file.size / (1024 * 1024)).toFixed(1)} MB` : 'No evidence selected'}</p>
-                </div>
+                {residentContext.trim() && (
+                  <>
+                    <h3>Resident context</h3>
+                    <p className="w-quote">“{residentContext.trim()}”</p>
+                  </>
+                )}
+                <div className="w-rule" />
+                <p className="w-review-foot">▦ {confirmLabel}</p>
               </article>
-              <aside className="review-checklist">
-                <p className="eyebrow">BEFORE YOU SAVE</p>
-                <h3>Report checklist</h3>
-                <ul>
-                  <li>
-                    <span>✓</span> Evidence attached
-                  </li>
-                  <li>
-                    <span>✓</span> Your observation included
-                  </li>
-                  <li>
-                    <span>✓</span> Required details complete
-                  </li>
-                </ul>
-                <p className="status-explainer">Reports are saved as drafts. You can update the status after sending the report through your chosen channel.</p>
+              <aside className="w-before">
+                <h2>Before you save</h2>
+                <p className="w-before-label">Location</p>
+                <p className="w-before-value">{location.trim() || 'Not provided'}</p>
+                <p className="w-before-label">Supporting evidence</p>
+                <p className="w-before-value">{`${attachmentLabel} · ${checked.length} observation${checked.length === 1 ? '' : 's'}`}</p>
+                {detailsComplete ? (
+                  <p className="w-complete">ⓘ Required details complete</p>
+                ) : (
+                  <p className="w-incomplete">ⓘ Still needed: {missingDetails.join(', ')}</p>
+                )}
+                <button className="w-secondary" type="button" onClick={() => goToPhase('details')}>
+                  Edit the details
+                </button>
+                <button className="w-link" type="button" onClick={() => goToPhase('observations')}>
+                  Review the evidence
+                </button>
               </aside>
             </div>
-            <div className="wizard-actions">
-              <button className="text-link" type="button" onClick={() => goToStep(3)}>
-                ← Back to details
+            <div className="w-foot">
+              <button className="w-link" type="button" onClick={() => goToPhase('details')}>
+                Back to details
               </button>
-              <button className="submit-button" type="submit" disabled={submitBusy}>
-                <span>{submitBusy ? 'Saving...' : 'Save report'}</span>
-                <span aria-hidden="true">→</span>
-              </button>
+              {signedIn ? (
+                <button className="w-primary" type="submit" disabled={submitBusy}>
+                  {submitBusy ? 'Saving…' : 'Save report'}
+                </button>
+              ) : (
+                <button
+                  className="w-primary"
+                  type="button"
+                  onClick={() => {
+                    if (onRequireAccount) {
+                      onRequireAccount(collectDraft('review'));
+                      return;
+                    }
+                    window.location.assign('/login');
+                  }}
+                >
+                  Sign in to save report <span aria-hidden="true">→</span>
+                </button>
+              )}
             </div>
-        </section>
-        <p className={`form-message${formError ? ' is-error' : ''}`} role="status" aria-live="polite">
-          {formMessage}
-        </p>
+          </>
+        )}
+
+        {formMessage && (
+          <p className={`w-form-error${formError ? '' : ' is-ok'}`} role="status" aria-live="polite">
+            {formMessage}
+          </p>
+        )}
+        {sessionExpired && onSignIn && (
+          <p className="w-expired-actions">
+            <button type="button" className="w-primary" onClick={() => onSignIn()}>
+              Sign in to continue
+            </button>
+          </p>
+        )}
       </form>
+      {pendingFile && (
+        <ConfirmDialog
+          title="Replace this photo?"
+          body="Replacing the evidence discards its analysis, observations, and edits. This cannot be undone."
+          confirmLabel="Replace photo"
+          safeLabel="Keep photo"
+          onConfirm={() => { const next = pendingFile; setPendingFile(null); applyFile(next); }}
+          onClose={() => { setPendingFile(null); if (fileInputRef.current) fileInputRef.current.value = ''; }}
+        />
+      )}
     </section>
+  );
+}
+
+function PrivacyCard({ stripMetadata, onStripChange, blurDetails, onBlurChange, disabled }) {
+  return (
+    <div className="w-privacy">
+      <p className="w-privacy-title">Privacy settings</p>
+      <div className="w-privacy-opt">
+        <div>
+          <strong>Remove photo metadata</strong>
+          <span>Keep location details under your control.</span>
+        </div>
+        <button
+          className={`w-switch${stripMetadata ? ' is-on' : ''}`}
+          type="button"
+          role="switch"
+          aria-checked={stripMetadata}
+          aria-label="Remove photo metadata"
+          disabled={disabled}
+          onClick={() => onStripChange(!stripMetadata)}
+        >
+          <span />
+        </button>
+      </div>
+      <div className="w-privacy-opt">
+        <div>
+          <strong>Blur identifying details</strong>
+          <span>Review any faces or number plates.</span>
+        </div>
+        <button
+          className={`w-switch${blurDetails ? ' is-on' : ''}`}
+          type="button"
+          role="switch"
+          aria-checked={blurDetails}
+          aria-label="Blur identifying details"
+          disabled={disabled}
+          onClick={() => onBlurChange(!blurDetails)}
+        >
+          <span />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AiBanner({ aiStatus, segmentationOn, reasoningOn }) {
+  return (
+    <div className="w-ai-banner" role="status">
+      <span className="w-ai-mark" aria-hidden="true">i</span>
+      <p>
+        {!aiStatus && (
+          <>
+            <strong>AI status unavailable.</strong> Your words remain your own; please avoid guessing at cause or severity.
+          </>
+        )}
+        {aiStatus && !segmentationOn && !reasoningOn && (
+          <>
+            <strong>AI suggestions are not connected.</strong> ProofPath does not analyze this image. Your words remain your own; please avoid guessing at cause or severity.
+          </>
+        )}
+        {aiStatus && (segmentationOn || reasoningOn) && (
+          <>
+            <strong>
+              AI connected: {[segmentationOn && 'object outlines', reasoningOn && 'report wording help'].filter(Boolean).join(' and ')}.
+            </strong>{' '}
+            Suggestions are unverified — your words remain your own; please avoid guessing at cause or severity.
+          </>
+        )}
+      </p>
+    </div>
   );
 }

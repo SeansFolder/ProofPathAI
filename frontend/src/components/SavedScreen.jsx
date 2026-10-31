@@ -1,106 +1,121 @@
 import React, { useState } from 'react';
-import { api } from '../api.js';
+import { api, formatLongDate } from '../api.js';
 
-export default function SavedScreen({ report, previewUrl, isVideo, canStatus, onBack, onReview, onStatusUpdated }) {
+const HEADINGS = {
+  Draft: { title: 'Report saved', sub: 'Your report is saved as a draft.' },
+  Submitted: { title: 'Report submitted', sub: 'Status updated after you delivered the report.' },
+  Resolved: { title: 'Report resolved', sub: 'Status updated after you confirmed the issue was addressed.' },
+};
+
+const ACTIVITY = {
+  Draft: { label: 'Draft saved', counts: null },
+  Submitted: { label: 'Marked as submitted', counts: 'Submission status updated.' },
+  Resolved: { label: 'Marked as resolved', counts: 'Resolution status updated.' },
+};
+
+export default function SavedScreen({ report, previewUrl, isVideo, canStatus, onBack, onReview, onDownload, onStatusUpdated }) {
   const [status, setStatus] = useState(report.status);
-  const [activity, setActivity] = useState(`${report.status} saved just now`);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const meta = [report.category, report.location,
-    new Intl.DateTimeFormat(undefined, { month: 'long', day: 'numeric', year: 'numeric' }).format(new Date(report.created_at)),
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  const heading = HEADINGS[status] || HEADINGS.Draft;
+  const activity = ACTIVITY[status] || ACTIVITY.Draft;
+  const selected = (report.observations || []).filter((item) => item.selected);
+  const attachmentCount = report.evidence_name ? 1 : 0;
+  const attachmentLabel = attachmentCount === 0 ? 'No evidence' : isVideo ? '1 video' : '1 photo';
+  const countsLine = `${attachmentLabel} · ${selected.length} confirmed observation${selected.length === 1 ? '' : 's'}`;
+  const publicCode = report.public_code || 'PP-0000';
+  const createdLong = formatLongDate((report.created_at || '').slice(0, 10)) ||
+    new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(report.created_at));
 
-  async function markSubmitted() {
+  async function markStatus(next) {
     setBusy(true);
     setMessage('');
     try {
-      const updated = await api.updateStatus(report.id, 'Submitted');
+      const updated = await api.updateStatus(report.id, next);
       setStatus(updated.status);
-      setActivity('Status updated to Submitted just now');
       setMessage('Status updated in ProofPath. The report was not sent to an agency.');
       onStatusUpdated(updated);
     } catch (error) {
-      setMessage(error.message || 'Status could not be updated.');
+      setMessage(error?.message || 'Status could not be updated.');
     } finally {
       setBusy(false);
     }
   }
 
-  function download() {
-    const content = [
-      `# ${report.title}`,
-      '',
-      `- Status: ${status}`,
-      `- Category: ${report.category}`,
-      `- Location: ${report.location || 'Not provided'}`,
-      `- Created: ${new Date(report.created_at).toLocaleString()}`,
-      `- Evidence file: ${report.evidence_name}`,
-      '',
-      '## Observation',
-      report.description,
-      '',
-      'ProofPath stores this report. It has not been sent to an agency.',
-    ].join('\n');
-    const url = URL.createObjectURL(new Blob([content], { type: 'text/markdown;charset=utf-8' }));
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${report.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'proofpath-report'}.md`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }
-
   return (
-    <section className="saved-screen" aria-labelledby="saved-heading">
-      <div className="saved-mark" aria-hidden="true">
-        ✓
-      </div>
-      <p className="eyebrow">REPORT SAVED</p>
-      <h1 id="saved-heading">Your report is saved.</h1>
-      <p>Your evidence and report details are together in your journal.</p>
-      <div className="saved-layout">
-        <article className="saved-card">
-          <div className="saved-card-heading">
+    <section className="w-flow w-saved" aria-labelledby="saved-heading">
+      <h1 id="saved-heading">{heading.title}</h1>
+      <p className="w-sub">{heading.sub}</p>
+      <div className="w-saved-layout">
+        <article className="w-saved-card">
+          <div className="w-saved-head">
             <div>
               <h2>{report.title}</h2>
-              <p>{meta}</p>
+              <p>{`${publicCode} · Created ${createdLong}`}</p>
             </div>
-            <span className="status-badge">{status}</span>
+            <span className="w-status-pill">{status}</span>
           </div>
-          <div>
+          <div className="w-saved-media">
             {isVideo ? (
-              <video src={previewUrl} controls playsInline style={{ width: '100%', maxHeight: 360, objectFit: 'contain', borderRadius: 9, background: '#eef1eb' }} />
+              <video src={previewUrl} controls playsInline />
             ) : (
-              <img src={previewUrl} alt={`Evidence for ${report.title}`} style={{ width: '100%', maxHeight: 360, objectFit: 'contain', borderRadius: 9, background: '#eef1eb' }} />
+              <img src={previewUrl} alt={`Evidence for ${report.title}`} />
             )}
           </div>
-          <div className="saved-activity">
-            <h3>Activity</h3>
-            <p>{activity}</p>
-          </div>
+          <p className="w-saved-location">
+            <span aria-hidden="true">◎</span> {report.location || 'No location provided'}
+          </p>
+          <div className="w-rule" />
+          <h3>Activity</h3>
+          <p className="w-activity-row">
+            <span className="w-activity-check" aria-hidden="true">✓</span>
+            <strong>{activity.label}</strong>
+            <span className="w-activity-when">Just now</span>
+          </p>
+          <p className="w-activity-counts">{activity.counts || countsLine}</p>
         </article>
-        <aside className="saved-actions-panel">
-          <p className="eyebrow">REPORT ACTIONS</p>
-          <h2>Current status</h2>
-          <p className="saved-status-copy">Update this after delivering the report through your chosen channel.</p>
-          {canStatus && (
-            <button className="submit-button" type="button" disabled={busy || status !== 'Draft'} onClick={markSubmitted}>
-              Mark as submitted
-            </button>
-          )}
-          <button className="secondary-action" type="button" onClick={download}>
+        <aside className="w-actions-panel">
+          <h2>Report actions</h2>
+          <p className="w-actions-row">
+            <strong>Current status</strong>
+            <span>{status}</span>
+          </p>
+          <button className="w-primary w-block" type="button" onClick={onDownload}>
             Download report
           </button>
-          <p role="status">{message}</p>
+          <div className="w-rule" />
+          {status === 'Draft' && (
+            <>
+              <p className="w-actions-hint">Update this after delivering the report.</p>
+              {canStatus && (
+                <button className="w-secondary w-block" type="button" disabled={busy} onClick={() => markStatus('Submitted')}>
+                  {busy ? 'Updating…' : 'Mark as submitted'}
+                </button>
+              )}
+            </>
+          )}
+          {status === 'Submitted' && (
+            <>
+              <p className="w-actions-hint">Update this after confirming the issue is resolved.</p>
+              {canStatus && (
+                <button className="w-secondary w-block" type="button" disabled={busy} onClick={() => markStatus('Resolved')}>
+                  {busy ? 'Updating…' : 'Mark as resolved'}
+                </button>
+              )}
+            </>
+          )}
+          {status === 'Resolved' && <p className="w-actions-hint">Your evidence remains attached to this report.</p>}
+          <p className="w-form-error" role="status" aria-live="polite">
+            {message}
+          </p>
         </aside>
       </div>
-      <div className="saved-actions">
-        <button className="text-link" type="button" onClick={onBack}>
-          ← Back to reports
+      <div className="w-foot">
+        <button className="w-link" type="button" onClick={onBack}>
+          Back to reports
         </button>
-        <button className="submit-button" type="button" onClick={onReview}>
+        <button className="w-outline" type="button" onClick={onReview}>
           Review this report
         </button>
       </div>
